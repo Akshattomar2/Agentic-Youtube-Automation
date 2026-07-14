@@ -1,17 +1,4 @@
-# ============================================================
-#  YouTube Shorts Automation — CrewAI + Groq + Pollinations
-# ============================================================
-#  Setup:
-#    pip install crewai moviepy edge-tts requests pillow numpy
-#                google-api-python-client google-auth-oauthlib
-#
-#  Set environment variables before running:
-#    export GROQ_API_KEY="your_groq_key_here"
-#
-#  Place client_secrets.json (Google OAuth) in the same folder.
-# ============================================================
 
-# --- Monkey patch (must be before moviepy import) -----------
 import PIL.Image
 if not hasattr(PIL.Image, "ANTIALIAS"):
     PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
@@ -38,7 +25,7 @@ from moviepy.editor import (
     concatenate_videoclips,
 )
 
-# ── Environment ──────────────────────────────────────────────
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -50,16 +37,16 @@ os.environ["OPENAI_API_BASE"]   = "https://api.groq.com/openai/v1"
 os.environ["OPENAI_MODEL_NAME"] = "llama-3.3-70b-versatile"
 os.environ["OPENAI_API_KEY"]    = groq_key
 
-# ── Config ───────────────────────────────────────────────────
+
 VIDEO_TOPIC    = "The bizarre history of the world's most expensive spice, Saffron"
-VIDEO_SIZE     = (1080, 1920)   # portrait / Shorts
-THUMBNAIL_SIZE = (1280, 720)    # landscape / YouTube thumbnail
+VIDEO_SIZE     = (1080, 1920)  
+THUMBNAIL_SIZE = (1280, 720)    
 FONT_SIZE      = 55
 OUTPUT_VIDEO   = "final_shorts_video.mp4"
 OUTPUT_THUMB   = "custom_thumbnail.jpg"
 YT_SCOPES      = ["https://www.googleapis.com/auth/youtube.upload"]
 
-# ── CrewAI Agents ────────────────────────────────────────────
+
 script_writer = Agent(
     role="Expert YouTube Growth Manager",
     goal="Create engaging scripts and optimise YouTube SEO metadata (title, tags, description).",
@@ -74,7 +61,7 @@ video_planner = Agent(
     verbose=True,
 )
 
-# ── Tasks ────────────────────────────────────────────────────
+
 task_write_script = Task(
     description=f"Write a fast-paced 60-second narration script about: {VIDEO_TOPIC}.",
     expected_output="Compelling paragraphs-only narration text — no brackets, no stage directions.",
@@ -96,7 +83,7 @@ task_plan_scenes = Task(
     dependencies=[task_write_script],
 )
 
-# ── Helpers ──────────────────────────────────────────────────
+
 def parse_agent_output(raw: str) -> dict:
     """Robustly parse JSON from the agent's output string."""
     # Strip markdown code fences if present
@@ -113,7 +100,7 @@ def parse_agent_output(raw: str) -> dict:
         except Exception:
             continue
 
-    # Last resort: swap single quotes → double quotes
+  
     try:
         return json.loads(raw.replace("'", '"'))
     except Exception as err:
@@ -206,7 +193,7 @@ def upload_to_youtube(video_path: str, thumbnail_path: str, title: str, descript
     print("🎉 Done! Check your YouTube channel.")
 
 
-# ── Main Pipeline ────────────────────────────────────────────
+
 def main():
     # Step 1 — Run CrewAI
     crew = Crew(
@@ -217,11 +204,11 @@ def main():
     print("🚀 Starting CrewAI workflow...")
     result = crew.kickoff()
 
-    # Step 2 — Parse output
+   
     data = _ensure_scene_defaults(parse_agent_output(str(result)))
     print("✅ Agent output parsed successfully.")
 
-    # Step 3 — Build video scenes
+   
     video_clips, subtitle_clips, current_time = [], [], 0.0
 
     for i, scene in enumerate(data["scenes"]):
@@ -244,18 +231,18 @@ def main():
         subtitle_clips.append(create_subtitle_clip(scene["narration_text"], audio.duration, current_time))
         current_time += audio.duration
 
-    # Step 4 — Render final video
+   
     print("\n🎞️  Rendering final video...")
     base = concatenate_videoclips(video_clips, method="compose")
     CompositeVideoClip([base] + subtitle_clips).write_videofile(
         OUTPUT_VIDEO, fps=24, codec="libx264", audio_codec="aac"
     )
 
-    # Step 5 — Download thumbnail
+   
     print("\n🖼️  Downloading thumbnail...")
     download_image(data["thumbnail_prompt"], OUTPUT_THUMB, *THUMBNAIL_SIZE)
 
-    # Step 6 — Upload to YouTube
+   
     upload_to_youtube(OUTPUT_VIDEO, OUTPUT_THUMB, data["youtube_title"], data["youtube_description"])
 
 
