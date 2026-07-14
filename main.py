@@ -1,250 +1,249 @@
-
 import PIL.Image
-if not hasattr(PIL.Image, "ANTIALIAS"):
+if not hasattr(PIL.Image, 'ANTIALIAS'):
     PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
 
-import ast
-import asyncio
-import json
 import os
-import sys
-
-import edge_tts
-import numpy as np
+import json
+import ast
+import logging
+import asyncio
 import requests
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from crewai import Agent, Task, Crew, Process
+from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, CompositeVideoClip
+import edge_tts
 
-from crewai import Agent, Crew, Process, Task
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from google_auth_oauthlib.flow import InstalledAppFlow
-from moviepy.editor import (
-    AudioFileClip,
-    CompositeVideoClip,
-    ImageClip,
-    concatenate_videoclips,
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("pipeline.log"),
+        logging.StreamHandler()
+    ]
 )
+logger = logging.getLogger(__name__)
 
-
-from dotenv import load_dotenv
-load_dotenv()
-
-groq_key = os.getenv("GROQ_API_KEY")
-if not groq_key:
-    sys.exit("❌  GROQ_API_KEY environment variable not set.")
-
-os.environ["OPENAI_API_BASE"]   = "https://api.groq.com/openai/v1"
+os.environ["OPENAI_API_BASE"] = "https://api.groq.com/openai/v1"
 os.environ["OPENAI_MODEL_NAME"] = "llama-3.3-70b-versatile"
-os.environ["OPENAI_API_KEY"]    = groq_key
+os.environ["OPENAI_API_KEY"] = "your_api_key"
 
-
-VIDEO_TOPIC    = "The bizarre history of the world's most expensive spice, Saffron"
-VIDEO_SIZE     = (1080, 1920)  
-THUMBNAIL_SIZE = (1280, 720)    
-FONT_SIZE      = 55
-OUTPUT_VIDEO   = "final_shorts_video.mp4"
-OUTPUT_THUMB   = "custom_thumbnail.jpg"
-YT_SCOPES      = ["https://www.googleapis.com/auth/youtube.upload"]
-
-
-script_writer = Agent(
-    role="Expert YouTube Growth Manager",
-    goal="Create engaging scripts and optimise YouTube SEO metadata (title, tags, description).",
-    backstory="You know exactly how to hook viewers and optimise algorithms to push vertical shorts viral.",
-    verbose=True,
-)
-
-video_planner = Agent(
-    role="Visual Director",
-    goal="Break down a script into visual scenes, create image prompts, and design a high-CTR thumbnail concept.",
-    backstory="You translate concepts into striking imagery for video segments and high-clickability banners.",
-    verbose=True,
-)
-
-
-task_write_script = Task(
-    description=f"Write a fast-paced 60-second narration script about: {VIDEO_TOPIC}.",
-    expected_output="Compelling paragraphs-only narration text — no brackets, no stage directions.",
-    agent=script_writer,
-)
-
-task_plan_scenes = Task(
-    description=(
-        "Break down the narration into exactly 4 sequential scenes. "
-        "For each scene provide an 'image_prompt' and the matching 'narration_text'. "
-        "Also output a single 'thumbnail_prompt' for a high-CTR concept, "
-        "a catchy 'youtube_title', and a 'youtube_description' packed with hashtags. "
-        "Output ONLY valid raw JSON — no markdown, no extra text — matching: "
-        '{"scenes":[{"image_prompt":"...","narration_text":"..."},...], '
-        '"thumbnail_prompt":"...","youtube_title":"...","youtube_description":"..."}'
-    ),
-    expected_output='Raw JSON with keys: "scenes", "thumbnail_prompt", "youtube_title", "youtube_description".',
-    agent=video_planner,
-    dependencies=[task_write_script],
-)
-
-
-def parse_agent_output(raw: str) -> dict:
-    """Robustly parse JSON from the agent's output string."""
-    # Strip markdown code fences if present
-    for fence in ("```json", "```"):
-        if fence in raw:
-            raw = raw.split(fence)[1].split("```")[0].strip()
-            break
-
-    for parser in (json.loads, ast.literal_eval):
-        try:
-            result = parser(raw)
-            if isinstance(result, dict):
-                return result
-        except Exception:
-            continue
-
-  
-    try:
-        return json.loads(raw.replace("'", '"'))
-    except Exception as err:
-        print("FATAL: Could not parse agent output:\n", raw)
-        raise err
-
-
-def _ensure_scene_defaults(data: dict) -> dict:
-    """Fill in fallback values if the agent omitted optional keys."""
-    if isinstance(data, list):
-        data = {"scenes": data}
-
-    data.setdefault(
-        "thumbnail_prompt",
-        "Cinematic close-up of vivid Saffron threads on a gold scale, hyper-detailed, 8k",
-    )
-    data.setdefault("youtube_title", "The Bizarre History of the World's Most Expensive Spice!")
-    data.setdefault(
-        "youtube_description",
-        "Discover the crazy history of Saffron! #shorts #history #saffron",
-    )
-    return data
-
-
-def download_image(prompt: str, path: str, width: int, height: int) -> None:
-    encoded = requests.utils.quote(prompt)
-    url = f"https://image.pollinations.ai/p/{encoded}?width={width}&height={height}&seed=42"
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    with open(path, "wb") as f:
-        f.write(r.content)
-
-
-async def generate_voiceover(text: str, path: str) -> None:
-    communicate = edge_tts.Communicate(text, "en-US-ChristopherNeural")
-    await communicate.save(path)
-
-
-def create_subtitle_clip(text: str, duration: float, start: float):
-    img = Image.new("RGBA", VIDEO_SIZE, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("arial.ttf", FONT_SIZE)
-    except IOError:
-        font = ImageFont.load_default()
-
-    bbox = draw.textbbox((0, 0), text, font=font)
-    x = (VIDEO_SIZE[0] - (bbox[2] - bbox[0])) // 2
-    y = int(VIDEO_SIZE[1] * 0.75)
-    draw.text((x, y), text, font=font, fill=(255, 255, 0, 255), stroke_width=5, stroke_fill=(0, 0, 0, 255))
-
-    return (
-        ImageClip(np.array(img))
-        .set_start(start)
-        .set_duration(duration)
-        .set_pos(("center", "top"))
-    )
-
-
-def upload_to_youtube(video_path: str, thumbnail_path: str, title: str, description: str) -> None:
-    print("\n🔐 Authenticating with YouTube...")
-    flow = InstalledAppFlow.from_client_secrets_file("client_secrets.json", YT_SCOPES)
-    credentials = flow.run_local_server(port=0)
-    youtube = build("youtube", "v3", credentials=credentials)
-
-    body = {
-        "snippet": {
-            "title": title,
-            "description": description,
-            "tags": ["shorts", "history", "spices", "ai"],
-            "categoryId": "22",
-        },
-        "status": {
-            "privacyStatus": "public",
-            "selfDeclaredMadeForKids": False,
-        },
+SPICE_DATASET = {
+    "saffron": {
+        "angle": "The dark economics, extreme manual labor, and historical thefts of the spice.",
+        "banned_words": ["mysterious", "exotic bazaars", "worth its weight in gold", "coveted"]
+    },
+    "black_pepper": {
+        "angle": "How black pepper launched the Age of Discovery, funded European empires, and was used as rent currency.",
+        "banned_words": ["common condiment", "table shaker", "ordinary spice", "black gold"]
+    },
+    "vanilla": {
+        "angle": "The genius botanical heist where a 12-year-old enslaved boy named Edmond Albius discovered hand-pollination.",
+        "banned_words": ["plain vanilla", "sweet flavor", "popular ice cream", "baking ingredient"]
+    },
+    "nutmeg": {
+        "angle": "The bloody Dutch war over the Banda Islands, leading to the exchange of Manhattan for a nutmeg island.",
+        "banned_words": ["holiday baking", "warm spice", "fall flavors", "eggnog"]
     }
-    media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
+}
 
-    print("📤 Uploading video...")
-    response = youtube.videos().insert(part="snippet,status", body=body, media_body=media).execute()
-    video_id = response["id"]
-    print(f"✅ Uploaded! Video ID: {video_id}")
+def create_subtitle_clip(text, duration, start_time, video_size=(1080, 1920), font_size=55):
+    try:
+        img = Image.new("RGBA", video_size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except IOError:
+            font = ImageFont.load_default()
+            
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        x = (video_size[0] - text_width) // 2
+        y = int(video_size[1] * 0.75) 
+        
+        draw.text((x, y), text, font=font, fill=(255, 255, 0, 255), stroke_width=5, stroke_fill=(0, 0, 0, 255))
+        return ImageClip(np.array(img)).set_start(start_time).set_duration(duration).set_pos(('center', 'top'))
+    except Exception as e:
+        logger.error(f"Failed to render subtitle clip: {e}")
+        raise
 
-    print("🖼️  Attaching thumbnail...")
-    youtube.thumbnails().set(
-        videoId=video_id,
-        media_body=MediaFileUpload(thumbnail_path, mimetype="image/jpeg"),
-    ).execute()
-    print("🎉 Done! Check your YouTube channel.")
+async def generate_voiceover(text, output_audio_path):
+    try:
+        communicate = edge_tts.Communicate(text, "en-US-ChristopherNeural")
+        await communicate.save(output_audio_path)
+    except Exception as e:
+        logger.error(f"TTS Engine Failure: {e}")
+        raise
 
+def download_image(prompt, output_image_path, width=1080, height=1920):
+    try:
+        encoded_prompt = requests.utils.quote(prompt)
+        url = f"https://image.pollinations.ai/p/{encoded_prompt}?width={width}&height={height}&seed=42"
+        response = requests.get(url, timeout=30)
+        if response.status_code == 200:
+            with open(output_image_path, 'wb') as f:
+                f.write(response.content)
+        else:
+            raise requests.exceptions.HTTPError(f"Status code: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Image Download Exception for prompt '{prompt[:30]}...': {e}")
+        raise
 
+def upload_to_youtube(video_path, thumbnail_path, title, description):
+    try:
+        logger.info("🔐 Accessing Google YouTube Data API v3 Matrix...")
+        SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
+        
+        if not os.path.exists('client_secrets.json'):
+            raise FileNotFoundError("Missing critical 'client_secrets.json' credentials in root.")
+            
+        flow = InstalledAppFlow.from_client_secrets_file('client_secrets.json', SCOPES)
+        credentials = flow.run_local_server(port=0, authorization_prompt_message="")
+        youtube = build('youtube', 'v3', credentials=credentials)
+        
+        logger.info(f"📤 Uploading video binary payload: {video_path}")
+        body = {
+            'snippet': {
+                'title': title[:100],  
+                'description': description,
+                'tags': ['shorts', 'history', 'spices', 'automation'],
+                'categoryId': '22'
+            },
+            'status': {
+                'privacyStatus': 'public',
+                'selfDeclaredMadeForKids': False
+            }
+        }
+        
+        media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype='video/mp4')
+        request = youtube.videos().insert(part='snippet,status', body=body, media_body=media)
+        response = request.execute()
+        video_id = response['id']
+        logger.info(f"✅ Core Video uploaded successfully! ID: {video_id}")
+        
+        logger.info("🖼️ Injecting high-CTR Cover Art Frame...")
+        youtube.thumbnails().set(
+            videoId=video_id,
+            media_body=MediaFileUpload(thumbnail_path, mimetype='image/jpeg')
+        ).execute()
+        logger.info("🎉 Complete Content Stack deployed live onto channel!")
+        
+    except Exception as e:
+        logger.error(f"YouTube Pipeline Interrupted: {e}")
+        print(f"\n💡 [FALLBACK] Video saved locally as '{video_path}'. Manual upload required.")
 
-def main():
-    # Step 1 — Run CrewAI
-    crew = Crew(
-        agents=[script_writer, video_planner],
-        tasks=[task_write_script, task_plan_scenes],
-        process=Process.sequential,
+def run_spice_pipeline(spice_name):
+    spice_info = SPICE_DATASET.get(spice_name.lower())
+    if not spice_info:
+        logger.error(f"Spice '{spice_name}' not configured in matrix dataset.")
+        return
+
+    logger.info(f"🚀 Launching Pipeline Engine for Topic: {spice_name.upper()}")
+    
+    script_writer = Agent(
+        role='Expert YouTube Growth Manager',
+        goal='Create high-retention 60-second shorts narration scripts.',
+        backstory='You write aggressive, fast-paced historical hooks that retain users on mobile loops.',
+        verbose=False
     )
-    print("🚀 Starting CrewAI workflow...")
+
+    video_planner = Agent(
+        role='Visual Director',
+        goal='Structure narration arrays and high-CTR thumbnail prompts into clean structural properties.',
+        backstory='You translate audio narratives into stunning visual compositions.',
+        verbose=False
+    )
+
+    task_write_script = Task(
+        description=f"Write a 40-second fast narration script about {spice_name}. Angle: {spice_info['angle']}. DO NOT use these words: {spice_info['banned_words']}.",
+        expected_output="Pure speech narration text blocks without annotations.",
+        agent=script_writer
+    )
+
+    task_plan_scenes = Task(
+        description="Map script into exactly 4 sequential segments. Generate fields: 'scenes' (array containing 'image_prompt' and 'narration_text'), 'thumbnail_prompt', 'youtube_title', and 'youtube_description'. Return absolute raw JSON string payload only.",
+        expected_output="JSON data matching the defined fields schema.",
+        agent=video_planner,
+        dependencies=[task_write_script]
+    )
+
+    crew = Crew(agents=[script_writer, video_planner], tasks=[task_write_script], process=Process.sequential)
     result = crew.kickoff()
 
-   
-    data = _ensure_scene_defaults(parse_agent_output(str(result)))
-    print("✅ Agent output parsed successfully.")
+    raw_output = str(result)
+    if "```json" in raw_output:
+        raw_output = raw_output.split("```json")[1].split("```")[0].strip()
+    elif "```" in raw_output:
+        raw_output = raw_output.split("```")[1].split("```")[0].strip()
 
-   
-    video_clips, subtitle_clips, current_time = [], [], 0.0
+    try:
+        data = json.loads(raw_output)
+    except json.JSONDecodeError:
+        try:
+            data = ast.literal_eval(raw_output)
+        except Exception:
+            logger.warning("Unstructured raw text parsing triggered standard failover dictionary.")
+            data = {
+                'scenes': [{'image_prompt': f'Cinematic shot of historic {spice_name}', 'narration_text': raw_output[:150]}],
+                'thumbnail_prompt': f'Epic studio shot of raw {spice_name}',
+                'youtube_title': f"The Mindblowing Truth About {spice_name.capitalize()}!",
+                'youtube_description': f"Uncovering the crazy hidden history of {spice_name}. #shorts"
+            }
 
-    for i, scene in enumerate(data["scenes"]):
-        print(f"\n🎬 Processing scene {i + 1} / {len(data['scenes'])}...")
-        img_path   = f"scene_{i}.jpg"
-        audio_path = f"scene_{i}.mp3"
+    scenes_list = data.get('scenes', data) if isinstance(data, dict) else data
+    if not isinstance(scenes_list, list):
+        scenes_list = [{'image_prompt': f'Cinematic asset for {spice_name}', 'narration_text': str(scenes_list)}]
 
-        download_image(scene["image_prompt"], img_path, *VIDEO_SIZE)
-        asyncio.run(generate_voiceover(scene["narration_text"], audio_path))
+    video_clips = []
+    subtitle_clips = []
+    current_time_marker = 0.0
 
-        audio = AudioFileClip(audio_path)
-        clip  = (
-            ImageClip(img_path)
-            .set_duration(audio.duration)
-            .resize(lambda t, d=audio.duration: 1.0 + 0.15 * (t / d))
-            .set_position(("center", "center"))
-            .set_audio(audio)
-        )
-        video_clips.append(clip)
-        subtitle_clips.append(create_subtitle_clip(scene["narration_text"], audio.duration, current_time))
-        current_time += audio.duration
+    for index, scene in enumerate(scenes_list):
+        logger.info(f"Processing Clip Sequence {index + 1}/{len(scenes_list)}...")
+        img_path = f"scene_{index}.jpg"
+        audio_path = f"scene_{index}.mp3"
+        
+        try:
+            download_image(scene.get('image_prompt', spice_name), img_path)
+            asyncio.run(generate_voiceover(scene.get('narration_text', ''), audio_path))
+            
+            audio_clip = AudioFileClip(audio_path)
+            img_clip = ImageClip(img_path).set_duration(audio_clip.duration)
+            
+            animated_clip = img_clip.resize(lambda t: 1.0 + 0.15 * (t / audio_clip.duration))
+            animated_clip = animated_clip.set_position(('center', 'center')).set_audio(audio_clip)
+            video_clips.append(animated_clip)
+            
+            sub_clip = create_subtitle_clip(scene.get('narration_text', ''), audio_clip.duration, current_time_marker)
+            subtitle_clips.append(sub_clip)
+            current_time_marker += audio_clip.duration
+        except Exception as step_error:
+            logger.error(f"Skipping corrupt frame matrix index {index}: {step_error}")
+            continue
 
-   
-    print("\n🎞️  Rendering final video...")
-    base = concatenate_videoclips(video_clips, method="compose")
-    CompositeVideoClip([base] + subtitle_clips).write_videofile(
-        OUTPUT_VIDEO, fps=24, codec="libx264", audio_codec="aac"
+    if not video_clips:
+        logger.fatal("No active visual streams available to process.")
+        return
+
+    logger.info("🎞️ Stitching media compositions...")
+    base_video = concatenate_videoclips(video_clips, method="compose")
+    output_filename = f"final_{spice_name}_short.mp4"
+    CompositeVideoClip([base_video] + subtitle_clips).write_videofile(output_filename, fps=24, codec="libx264", audio_codec="aac")
+    
+    thumb_filename = f"thumb_{spice_name}.jpg"
+    download_image(data.get('thumbnail_prompt', spice_name), thumb_filename, width=1280, height=720)
+    
+    upload_to_youtube(
+        video_path=output_filename,
+        thumbnail_path=thumb_filename,
+        title=data.get('youtube_title', f"Secrets of {spice_name.capitalize()}"),
+        description=data.get('youtube_description', '#shorts')
     )
 
-   
-    print("\n🖼️  Downloading thumbnail...")
-    download_image(data["thumbnail_prompt"], OUTPUT_THUMB, *THUMBNAIL_SIZE)
-
-   
-    upload_to_youtube(OUTPUT_VIDEO, OUTPUT_THUMB, data["youtube_title"], data["youtube_description"])
-
-
 if __name__ == "__main__":
-    main()
+    target_topic = "black_pepper" 
+    run_spice_pipeline(target_topic)
