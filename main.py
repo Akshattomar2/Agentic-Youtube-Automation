@@ -1,249 +1,338 @@
-import PIL.Image
-if not hasattr(PIL.Image, 'ANTIALIAS'):
+mport PIL.Image
+if not hasattr(PIL.Image, "ANTIALIAS"):
     PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
 
 import os
+import sys
 import json
-import ast
+import random
 import logging
 import asyncio
 import requests
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from crewai import Agent, Task, Crew, Process
-from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, CompositeVideoClip
-import edge_tts
+from pydantic import BaseModel, Field
+from typing import List
 
+import edge_tts
+from crewai import Agent, Crew, Process, Task
+from dotenv import load_dotenv
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from moviepy.editor import (
+    AudioFileClip,
+    CompositeVideoClip,
+    ImageClip,
+    concatenate_videoclips,
+)
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
     handlers=[
-        logging.FileHandler("pipeline.log"),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("pipeline.log", encoding="utf-8"),
+    ],
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-os.environ["OPENAI_API_BASE"] = "https://api.groq.com/openai/v1"
+load_dotenv()
+
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_KEY:
+    log.critical("GROQ_API_KEY missing from your local .env file! Please add it there.")
+    sys.exit(1)
+
+os.environ["OPENAI_API_BASE"]   = "https://api.groq.com/openai/v1"
 os.environ["OPENAI_MODEL_NAME"] = "llama-3.3-70b-versatile"
-os.environ["OPENAI_API_KEY"] = "your_api_key"
+os.environ["OPENAI_API_KEY"]    = GROQ_KEY
 
-SPICE_DATASET = {
-    "saffron": {
-        "angle": "The dark economics, extreme manual labor, and historical thefts of the spice.",
-        "banned_words": ["mysterious", "exotic bazaars", "worth its weight in gold", "coveted"]
-    },
-    "black_pepper": {
-        "angle": "How black pepper launched the Age of Discovery, funded European empires, and was used as rent currency.",
-        "banned_words": ["common condiment", "table shaker", "ordinary spice", "black gold"]
-    },
-    "vanilla": {
-        "angle": "The genius botanical heist where a 12-year-old enslaved boy named Edmond Albius discovered hand-pollination.",
-        "banned_words": ["plain vanilla", "sweet flavor", "popular ice cream", "baking ingredient"]
-    },
-    "nutmeg": {
-        "angle": "The bloody Dutch war over the Banda Islands, leading to the exchange of Manhattan for a nutmeg island.",
-        "banned_words": ["holiday baking", "warm spice", "fall flavors", "eggnog"]
-    }
-}
+VIDEO_W        = 1080
+VIDEO_H        = 1920
+VIDEO_FPS      = 24
+OUTPUT_VIDEO   = "final_shorts_video.mp4"
+OUTPUT_THUMB   = "thumbnail.jpg"
+FONT_SIZE      = 65             
+CAPTION_Y_FRAC = 0.55          
+YT_SCOPES      = ["https://www.googleapis.com/auth/youtube.upload"]
 
-def create_subtitle_clip(text, duration, start_time, video_size=(1080, 1920), font_size=55):
-    try:
-        img = Image.new("RGBA", video_size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except IOError:
-            font = ImageFont.load_default()
-            
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        x = (video_size[0] - text_width) // 2
-        y = int(video_size[1] * 0.75) 
-        
-        draw.text((x, y), text, font=font, fill=(255, 255, 0, 255), stroke_width=5, stroke_fill=(0, 0, 0, 255))
-        return ImageClip(np.array(img)).set_start(start_time).set_duration(duration).set_pos(('center', 'top'))
-    except Exception as e:
-        logger.error(f"Failed to render subtitle clip: {e}")
-        raise
+TOPICS = [
+    "turmeric", "saffron", "black_pepper", "vanilla", 
+    "cinnamon", "nutmeg", "cardamom", "cloves", "long_pepper", "paprika"
+]
 
-async def generate_voiceover(text, output_audio_path):
-    try:
-        communicate = edge_tts.Communicate(text, "en-US-ChristopherNeural")
-        await communicate.save(output_audio_path)
-    except Exception as e:
-        logger.error(f"TTS Engine Failure: {e}")
-        raise
+class Scene(BaseModel):
+    narration: str = Field(description="Fast-paced, highly dramatic 8 to 10-second narration text.")
+    image_prompt: str = Field(description="Cinematic detailed description for Pollinations AI to draw.")
 
-def download_image(prompt, output_image_path, width=1080, height=1920):
-    try:
-        encoded_prompt = requests.utils.quote(prompt)
-        url = f"https://image.pollinations.ai/p/{encoded_prompt}?width={width}&height={height}&seed=42"
-        response = requests.get(url, timeout=30)
-        if response.status_code == 200:
-            with open(output_image_path, 'wb') as f:
-                f.write(response.content)
-        else:
-            raise requests.exceptions.HTTPError(f"Status code: {response.status_code}")
-    except Exception as e:
-        logger.error(f"Image Download Exception for prompt '{prompt[:30]}...': {e}")
-        raise
+class VideoStory(BaseModel):
+    angle_title: str = Field(description="Viral title based on the researched angle.")
+    scenes: List[Scene] = Field(description="Strict list of exactly 4 sequential scenes.", min_length=4, max_length=4)
 
-def upload_to_youtube(video_path, thumbnail_path, title, description):
-    try:
-        logger.info("🔐 Accessing Google YouTube Data API v3 Matrix...")
-        SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
-        
-        if not os.path.exists('client_secrets.json'):
-            raise FileNotFoundError("Missing critical 'client_secrets.json' credentials in root.")
-            
-        flow = InstalledAppFlow.from_client_secrets_file('client_secrets.json', SCOPES)
-        credentials = flow.run_local_server(port=0, authorization_prompt_message="")
-        youtube = build('youtube', 'v3', credentials=credentials)
-        
-        logger.info(f"📤 Uploading video binary payload: {video_path}")
-        body = {
-            'snippet': {
-                'title': title[:100],  
-                'description': description,
-                'tags': ['shorts', 'history', 'spices', 'automation'],
-                'categoryId': '22'
-            },
-            'status': {
-                'privacyStatus': 'public',
-                'selfDeclaredMadeForKids': False
-            }
-        }
-        
-        media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype='video/mp4')
-        request = youtube.videos().insert(part='snippet,status', body=body, media_body=media)
-        response = request.execute()
-        video_id = response['id']
-        logger.info(f"✅ Core Video uploaded successfully! ID: {video_id}")
-        
-        logger.info("🖼️ Injecting high-CTR Cover Art Frame...")
-        youtube.thumbnails().set(
-            videoId=video_id,
-            media_body=MediaFileUpload(thumbnail_path, mimetype='image/jpeg')
-        ).execute()
-        logger.info("🎉 Complete Content Stack deployed live onto channel!")
-        
-    except Exception as e:
-        logger.error(f"YouTube Pipeline Interrupted: {e}")
-        print(f"\n💡 [FALLBACK] Video saved locally as '{video_path}'. Manual upload required.")
-
-def run_spice_pipeline(spice_name):
-    spice_info = SPICE_DATASET.get(spice_name.lower())
-    if not spice_info:
-        logger.error(f"Spice '{spice_name}' not configured in matrix dataset.")
-        return
-
-    logger.info(f"🚀 Launching Pipeline Engine for Topic: {spice_name.upper()}")
+def clear_old_cache():
+    """Ensures absolutely zero leaking of old clips from previous pipeline iterations."""
+    log.info("Cleaning up historical cache workspace...")
+    files_to_remove = [OUTPUT_VIDEO, OUTPUT_THUMB]
+    for i in range(10):
+        files_to_remove.extend([f"scene_{i}_voice.mp3", f"scene_{i}_ai.jpg"])
     
-    script_writer = Agent(
-        role='Expert YouTube Growth Manager',
-        goal='Create high-retention 60-second shorts narration scripts.',
-        backstory='You write aggressive, fast-paced historical hooks that retain users on mobile loops.',
-        verbose=False
+    for file in files_to_remove:
+        if os.path.exists(file):
+            try:
+                os.remove(file)
+            except Exception:
+                pass
+
+def generate_autonomous_story(topic: str) -> VideoStory:
+    researcher = Agent(
+        role="Senior Historical Detective",
+        goal="Brainstorm a shocking, bizarre, or lesser-known dark historical incident about the requested topic.",
+        backstory="Master of hidden histories. You dig up forgotten wars, ancient medicinal thefts, or secrets.",
+        verbose=False,
     )
 
-    video_planner = Agent(
-        role='Visual Director',
-        goal='Structure narration arrays and high-CTR thumbnail prompts into clean structural properties.',
-        backstory='You translate audio narratives into stunning visual compositions.',
-        verbose=False
+    script_writer = Agent(
+        role="Viral Shorts Producer",
+        goal="Format the historical incident into a high-retention 40-second script split across 4 scenes with image prompts.",
+        backstory="YouTube Shorts editing wizard. You structure narration into 4 punchy segments with perfect descriptive prompts.",
+        verbose=False,
+    )
+
+    task_research = Task(
+        description=f"Find a unique, dramatic, or scandalous historical fact about '{topic}'. Focus on high-drama true stories.",
+        expected_output="A summarized historical angle or story selected.",
+        agent=researcher,
     )
 
     task_write_script = Task(
-        description=f"Write a 40-second fast narration script about {spice_name}. Angle: {spice_info['angle']}. DO NOT use these words: {spice_info['banned_words']}.",
-        expected_output="Pure speech narration text blocks without annotations.",
-        agent=script_writer
+        description=(
+            "Using the researched angle, generate a 4-scene blueprint mapping out narration and image prompts. "
+            "You MUST output raw JSON text only matching this exact structure: \n"
+            "{\n"
+            '  "angle_title": "Viral Hook Title Here",\n'
+            '  "scenes": [\n'
+            '    {"narration": "8-10 second fast narration text", "image_prompt": "Cinematic visual description for AI graphics generation"},\n'
+            '    {"narration": "...", "image_prompt": "..."},\n'
+            '    {"narration": "...", "image_prompt": "..."},\n'
+            '    {"narration": "...", "image_prompt": "..."}\n'
+            "  ]\n"
+            "}\n"
+            "Do not output markdown blocks like ```json, just output clean raw text starting with '{' and ending with '}'."
+        ),
+        expected_output="A raw JSON string containing angle_title and exactly 4 scenes.",
+        agent=script_writer,
+        dependencies=[task_research]
     )
 
-    task_plan_scenes = Task(
-        description="Map script into exactly 4 sequential segments. Generate fields: 'scenes' (array containing 'image_prompt' and 'narration_text'), 'thumbnail_prompt', 'youtube_title', and 'youtube_description'. Return absolute raw JSON string payload only.",
-        expected_output="JSON data matching the defined fields schema.",
-        agent=video_planner,
-        dependencies=[task_write_script]
-    )
-
-    crew = Crew(agents=[script_writer, video_planner], tasks=[task_write_script], process=Process.sequential)
+    crew = Crew(agents=[researcher, script_writer], tasks=[task_research, task_write_script], process=Process.sequential)
     result = crew.kickoff()
-
-    raw_output = str(result)
+    
+    raw_output = str(result.raw).strip()
+    
     if "```json" in raw_output:
         raw_output = raw_output.split("```json")[1].split("```")[0].strip()
     elif "```" in raw_output:
         raw_output = raw_output.split("```")[1].split("```")[0].strip()
-
+        
     try:
         data = json.loads(raw_output)
-    except json.JSONDecodeError:
-        try:
-            data = ast.literal_eval(raw_output)
-        except Exception:
-            logger.warning("Unstructured raw text parsing triggered standard failover dictionary.")
-            data = {
-                'scenes': [{'image_prompt': f'Cinematic shot of historic {spice_name}', 'narration_text': raw_output[:150]}],
-                'thumbnail_prompt': f'Epic studio shot of raw {spice_name}',
-                'youtube_title': f"The Mindblowing Truth About {spice_name.capitalize()}!",
-                'youtube_description': f"Uncovering the crazy hidden history of {spice_name}. #shorts"
-            }
+        return VideoStory(**data)
+    except Exception as e:
+        log.error(f"JSON Parsing failed. Falling back to structured backup template. Error: {e}")
+        return VideoStory(
+            angle_title=f"The Forbidden Mystery of {topic.title()}",
+            scenes=[
+                Scene(narration=f"History hides dark secrets about {topic}. Secrets kept under lock and key.", image_prompt=f"Cinematic historic dark mystery visual of {topic}, cinematic lighting"),
+                Scene(narration="Powerful empires fought silent bloody wars over this resource.", image_prompt=f"Ancient royal storehouses filled with {topic}, guards watching, dramatic atmosphere"),
+                Scene(narration="A strange ancient law made possession punishable by death.", image_prompt="Dark medieval courtroom, judge pointing finger angrily, historical accuracy"),
+                Scene(narration="And today, you still use it completely unaware of its bloody past.", image_prompt=f"Modern cinematic kitchen close up showing {topic} spilling on counter, high detail 8k")
+            ]
+        )
 
-    scenes_list = data.get('scenes', data) if isinstance(data, dict) else data
-    if not isinstance(scenes_list, list):
-        scenes_list = [{'image_prompt': f'Cinematic asset for {spice_name}', 'narration_text': str(scenes_list)}]
+def download_pollinations_image(prompt: str, out_path: str) -> str:
+    log.info(f"🎨 Rendering fresh Pollinations Image for prompt: '{prompt[:40]}...'")
+    
+    clean_prompt = prompt.strip()
+    encoded_prompt = requests.utils.quote(clean_prompt)
+    
+    base_parts = ["https://", "image.pollinations.ai", "/p/"]
+    base_url = "".join(base_parts)
+    
+    url = f"{base_url}{encoded_prompt}?width={VIDEO_W}&height={VIDEO_H}&seed={random.randint(1, 99999)}"
+    
+    try:
+        r = requests.get(url, timeout=45)
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            f.write(r.content)
+        return out_path
+    except Exception as e:
+        log.error(f"❌ Image engine failure: {e}")
+        raise
 
-    video_clips = []
-    subtitle_clips = []
-    current_time_marker = 0.0
+async def _tts(text: str, path: str) -> None:
+    await edge_tts.Communicate(text, "en-US-ChristopherNeural").save(path)
 
-    for index, scene in enumerate(scenes_list):
-        logger.info(f"Processing Clip Sequence {index + 1}/{len(scenes_list)}...")
-        img_path = f"scene_{index}.jpg"
-        audio_path = f"scene_{index}.mp3"
+def generate_voiceover(text: str, path: str) -> None:
+    try:
+        asyncio.run(_tts(text, path))
+    except Exception as e:
+        log.error("TTS failed: %s", e)
+        raise
+
+def make_ken_burns_clip(image_path: str, duration: float) -> ImageClip:
+    """Applies continuous zoom styling on pure image files."""
+    try:
+        clip = ImageClip(image_path).set_duration(duration)
+        animated_clip = clip.resize(lambda t: 1.0 + 0.18 * (t / duration))
+        return animated_clip.set_position(('center', 'center'))
+    except Exception as e:
+        log.error(f"Ken Burns rendering failure: {e}")
+        raise
+
+def generate_captions_for_scene(text: str, total_duration: float, start_timeline: float) -> List[ImageClip]:
+    words = text.split()
+    chunks = []
+    chunk_size = 3  
+    
+    for i in range(0, len(words), chunk_size):
+        chunks.append(" ".join(words[i:i + chunk_size]))
+    
+    num_chunks = len(chunks)
+    if num_chunks == 0:
+        return []
+        
+    chunk_duration = total_duration / num_chunks
+    caption_clips = []
+
+    for idx, chunk_text in enumerate(chunks):
+        chunk_start = start_timeline + (idx * chunk_duration)
+        img = Image.new("RGBA", (VIDEO_W, VIDEO_H), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
         
         try:
-            download_image(scene.get('image_prompt', spice_name), img_path)
-            asyncio.run(generate_voiceover(scene.get('narration_text', ''), audio_path))
-            
-            audio_clip = AudioFileClip(audio_path)
-            img_clip = ImageClip(img_path).set_duration(audio_clip.duration)
-            
-            animated_clip = img_clip.resize(lambda t: 1.0 + 0.15 * (t / audio_clip.duration))
-            animated_clip = animated_clip.set_position(('center', 'center')).set_audio(audio_clip)
-            video_clips.append(animated_clip)
-            
-            sub_clip = create_subtitle_clip(scene.get('narration_text', ''), audio_clip.duration, current_time_marker)
-            subtitle_clips.append(sub_clip)
-            current_time_marker += audio_clip.duration
-        except Exception as step_error:
-            logger.error(f"Skipping corrupt frame matrix index {index}: {step_error}")
-            continue
+            font = ImageFont.truetype("arial.ttf", FONT_SIZE)
+        except IOError:
+            font = ImageFont.load_default()
 
-    if not video_clips:
-        logger.fatal("No active visual streams available to process.")
+        lines = []
+        words_in_chunk = chunk_text.split()
+        if len(words_in_chunk) > 2:
+            lines.append(" ".join(words_in_chunk[:2]))
+            lines.append(" ".join(words_in_chunk[2:]))
+        else:
+            lines.append(chunk_text)
+
+        line_h = FONT_SIZE + 10
+        total_h = line_h * len(lines)
+        y_start = int(VIDEO_H * CAPTION_Y_FRAC) - total_h // 2
+
+        for line_idx, ln in enumerate(lines):
+            ln = ln.upper()
+            bbox = draw.textbbox((0, 0), ln, font=font)
+            x = (VIDEO_W - (bbox[2] - bbox[0])) // 2
+            y = y_start + line_idx * line_h
+            
+            draw.text((x, y), ln, font=font, fill=(255, 255, 0, 255),
+                      stroke_width=6, stroke_fill=(0, 0, 0, 255))
+
+        cap_clip = (
+            ImageClip(np.array(img))
+            .set_start(chunk_start)
+            .set_duration(chunk_duration)
+            .set_pos(("center", "top"))
+        )
+        caption_clips.append(cap_clip)
+
+    return caption_clips
+
+def upload_to_youtube(video_path: str, thumb_path: str, title: str, description: str) -> None:
+    if not os.path.exists("client_secrets.json"):
+        log.warning("⚠️ Manual upload required — client_secrets configuration file not found.")
         return
 
-    logger.info("🎞️ Stitching media compositions...")
-    base_video = concatenate_videoclips(video_clips, method="compose")
-    output_filename = f"final_{spice_name}_short.mp4"
-    CompositeVideoClip([base_video] + subtitle_clips).write_videofile(output_filename, fps=24, codec="libx264", audio_codec="aac")
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file("client_secrets.json", YT_SCOPES)
+        creds = flow.run_local_server(port=0, authorization_prompt_message="")
+        youtube = build("youtube", "v3", credentials=creds)
+        
+        body = {
+            "snippet": {
+                "title": title[:100],
+                "description": description,
+                "tags": ["shorts", "history", "facts", "ai", "automation"],
+                "categoryId": "22",
+            },
+            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
+        }
+
+        media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
+        response = youtube.videos().insert(part="snippet,status", body=body, media_body=media).execute()
+        video_id = response["id"]
+        log.info(f"✅ Upload Complete! ID: {video_id}")
+        
+        youtube.thumbnails().set(
+            videoId=video_id,
+            media_body=MediaFileUpload(thumb_path, mimetype="image/jpeg"),
+        ).execute()
+        
+    except Exception as e:
+        log.error(f"YouTube Upload Failed: {e}")
+
+def run_pipeline(topic_key: str) -> None:
+    clear_old_cache()
     
-    thumb_filename = f"thumb_{spice_name}.jpg"
-    download_image(data.get('thumbnail_prompt', spice_name), thumb_filename, width=1280, height=720)
-    
+    story_data = generate_autonomous_story(topic_key)
+    log.info(f"🧠 AI Blueprint Ready: '{story_data.angle_title}'")
+
+    scene_clips = []
+    caption_clips = []
+    timeline = 0.0
+
+    for i, scene in enumerate(story_data.scenes):
+        audio_path = f"scene_{i}_voice.mp3"
+        image_path = f"scene_{i}_ai.jpg"
+
+        generate_voiceover(scene.narration, audio_path)
+        download_pollinations_image(scene.image_prompt, image_path)
+
+        try:
+            audio = AudioFileClip(audio_path)
+            bg_clip = make_ken_burns_clip(image_path, audio.duration).set_audio(audio)
+            scene_clips.append(bg_clip)
+
+            scene_captions = generate_captions_for_scene(scene.narration, audio.duration, timeline)
+            caption_clips.extend(scene_captions)
+            
+            timeline += audio.duration
+        except Exception as e:
+            log.critical(f"Compilation crashed at scene generation block: {e}"); sys.exit(1)
+
+    log.info("Rendering final composite layers...")
+    try:
+        base_video = concatenate_videoclips(scene_clips, method="compose")
+        final_video = CompositeVideoClip([base_video] + caption_clips)
+        final_video.write_videofile(
+            OUTPUT_VIDEO, 
+            fps=VIDEO_FPS, 
+            codec="libx264", 
+            audio_codec="aac"
+        )
+    except Exception as e:
+        log.critical(f"Render setup failed: {e}"); sys.exit(1)
+
+    thumbnail_prompt = f"Highly dramatic, cinematic close-up relating to {story_data.angle_title}, studio lighting, highly detailed 8k"
+    download_pollinations_image(thumbnail_prompt, OUTPUT_THUMB)
+
     upload_to_youtube(
-        video_path=output_filename,
-        thumbnail_path=thumb_filename,
-        title=data.get('youtube_title', f"Secrets of {spice_name.capitalize()}"),
-        description=data.get('youtube_description', '#shorts')
+        video_path=OUTPUT_VIDEO,
+        thumb_path=OUTPUT_THUMB,
+        title=f"{story_data.angle_title[:80]}! 😱 #shorts",
+        description=f"An incredible true history story about {topic_key}.\n\n#shorts #history #facts",
     )
 
 if __name__ == "__main__":
-    target_topic = "black_pepper" 
-    run_spice_pipeline(target_topic)
+    selected_topic = random.choice(TOPICS)
+    run_pipeline(selected_topic)
