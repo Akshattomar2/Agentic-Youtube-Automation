@@ -10,7 +10,7 @@
 
 *Fully automated pipeline that writes, visualises, voices, assembles, and uploads a YouTube Short — zero manual effort.*
 
-> 🚀 **[Watch the AI-generated output live on YouTube →](https://youtube.com/shorts/Sk60Z3QCZZY)**
+> 🚀 **[Watch the AI-generated output live on YouTube →]([https://youtube.com/shorts/Sk60Z3QCZZ](https://youtube.com/shorts/O1gcFjUT0TA?si=mIGdWt-Hqjky6MmO)Y)**
 
 </div>
 
